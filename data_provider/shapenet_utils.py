@@ -348,6 +348,420 @@ class GraphDataset(Dataset):
             return self.datalist[idx].pos, self.datalist[idx].x, self.datalist[idx].y, self.datalist[idx].surf, \
                 data.edge_index, self.valid_list[idx]
 
+# ShapeNetCar For UPT
+import scipy
+import os
+
+import numpy as np
+import torch
+from pathlib import Path
+from kappautils.param_checking import to_3tuple, to_2tuple
+from kappadata.datasets import KDDataset
+from torch_geometric.nn.pool import radius, radius_graph
+
+from kappadata.collators import KDSingleCollator
+from kappadata.wrappers import ModeWrapper
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import default_collate
+
+
+class ShapenetCar(KDDataset):
+    # generated with torch.randperm(889, generator=torch.Generator().manual_seed(0))[:189]
+    TEST_INDICES = {
+        550, 592, 229, 547, 62, 464, 798, 836, 5, 732, 876, 843, 367, 496,
+        142, 87, 88, 101, 303, 352, 517, 8, 462, 123, 348, 714, 384, 190,
+        505, 349, 174, 805, 156, 417, 764, 788, 645, 108, 829, 227, 555, 412,
+        854, 21, 55, 210, 188, 274, 646, 320, 4, 344, 525, 118, 385, 669,
+        113, 387, 222, 786, 515, 407, 14, 821, 239, 773, 474, 725, 620, 401,
+        546, 512, 837, 353, 537, 770, 41, 81, 664, 699, 373, 632, 411, 212,
+        678, 528, 120, 644, 500, 767, 790, 16, 316, 259, 134, 531, 479, 356,
+        641, 98, 294, 96, 318, 808, 663, 447, 445, 758, 656, 177, 734, 623,
+        216, 189, 133, 427, 745, 72, 257, 73, 341, 584, 346, 840, 182, 333,
+        218, 602, 99, 140, 809, 878, 658, 779, 65, 708, 84, 653, 542, 111,
+        129, 676, 163, 203, 250, 209, 11, 508, 671, 628, 112, 317, 114, 15,
+        723, 746, 765, 720, 828, 662, 665, 399, 162, 495, 135, 121, 181, 615,
+        518, 749, 155, 363, 195, 551, 650, 877, 116, 38, 338, 849, 334, 109,
+        580, 523, 631, 713, 607, 651, 168,
+    }
+
+    def __init__(
+            self,
+            split,
+            data_path=None,
+            radius_graph_r=None,
+            radius_graph_max_num_neighbors=None,
+            num_input_points_ratio=None,
+            num_query_points_ratio=None,
+            grid_resolution=None,
+            num_supernodes=None,
+            standardize_query_pos=False,
+            concat_pos_to_sdf=False,
+            seed=None,
+            fun_dim=None,
+            **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.split = split
+        self.data_path = data_path
+        self.radius_graph_r = radius_graph_r
+        self.radius_graph_max_num_neighbors = radius_graph_max_num_neighbors or int(1e10)
+        self.num_supernodes = num_supernodes
+        self.seed = seed
+        if num_input_points_ratio is None:
+            self.num_input_points_ratio = None
+        else:
+            self.num_input_points_ratio = to_2tuple(num_input_points_ratio)
+        self.num_query_points_ratio = num_query_points_ratio
+        if grid_resolution is not None:
+            self.grid_resolution = to_3tuple(grid_resolution)
+        else:
+            self.grid_resolution = None
+        self.fun_dim = fun_dim
+
+        # define spatial min/max of simulation (for normalizing to [0, 1] and then scaling to [0, 200] for pos_embed)
+        self.domain_min = torch.tensor([-2.0, -1.0, -4.5])
+        self.domain_max = torch.tensor([2.0, 4.5, 6.0])
+        self.scale = 200
+        self.standardize_query_pos = standardize_query_pos
+        self.concat_pos_to_sdf = concat_pos_to_sdf
+
+        # mean/std for normalization (calculated on the 700 train samples)
+        self.mean_in = torch.tensor([0.0])
+        self.std_in = torch.tensor([1.0])
+        self.mean_out = torch.tensor([-36.3099])
+        self.std_out = torch.tensor([48.5743])
+        self.mean_f = torch.tensor([0.0] * self.fun_dim)
+        self.std_f = torch.tensor([1.0] * self.fun_dim)
+
+        self.coef_norm = (self.mean_in, self.std_in, self.mean_out, self.std_out)
+
+        self.source_root = Path(os.path.join(self.data_path, "preprocessed_data"))
+        assert self.source_root.exists(), f"'{self.source_root.as_posix()}' doesn't exist"
+        assert self.source_root.name == "preprocessed_data", f"'{self.source_root.as_posix()}' is not preprocessed folder"
+
+        # discover uris
+        self.uris = []
+        for i in range(9):
+            param_uri = self.source_root / f"param{i}"
+            for name in sorted(os.listdir(param_uri)):
+                sample_uri = param_uri / name
+                if sample_uri.is_dir():
+                    self.uris.append(sample_uri)
+        assert len(self.uris) == 889, f"found {len(self.uris)} uris instead of 889"
+        # split into train/test uris
+        if split == "train":
+            train_idxs = [i for i in range(len(self.uris)) if i not in self.TEST_INDICES]
+            self.uris = [self.uris[train_idx] for train_idx in train_idxs]
+            assert len(self.uris) == 700
+        elif split == "test":
+            self.uris = [self.uris[test_idx] for test_idx in self.TEST_INDICES]
+            assert len(self.uris) == 189
+        else:
+            raise NotImplementedError
+
+    def __len__(self):
+        return len(self.uris)
+
+    # noinspection PyUnusedLocal
+    def getitem_pressure(self, idx, ctx=None):
+        p = torch.load(self.uris[idx] / "pressure.th")
+        p -= self.mean_out
+        p /= self.std_out
+        return p
+
+    # noinspection PyUnusedLocal
+    def getitem_grid_pos(self, idx=None, ctx=None):
+        if ctx is not None and "grid_pos" in ctx:
+            return ctx["grid_pos"]
+        # generate positions for a regular grid (e.g. for GINO encoder)
+        assert self.grid_resolution is not None
+        x_linspace = torch.linspace(0, self.scale, self.grid_resolution[0])
+        y_linspace = torch.linspace(0, self.scale, self.grid_resolution[1])
+        z_linspace = torch.linspace(0, self.scale, self.grid_resolution[2])
+        # generate positions (grid_resolution[0] * grid_resolution[1], 2)
+        meshgrid = torch.meshgrid(x_linspace, y_linspace, z_linspace, indexing="ij")
+        grid_pos = torch.stack(meshgrid).flatten(start_dim=1).T
+        #
+        if ctx is not None:
+            assert "grid_pos" not in ctx
+            ctx["grid_pos"] = grid_pos
+        return grid_pos
+
+    def getitem_mesh_to_grid_edges(self, idx, ctx=None):
+        assert self.grid_resolution is not None
+        assert self.radius_graph_r is not None
+        mesh_pos = self.getitem_mesh_pos(idx, ctx=ctx)
+        grid_pos = self.getitem_grid_pos(idx, ctx=ctx)
+        # create graph between mesh and regular grid points
+        edges = radius(
+            x=mesh_pos,
+            y=grid_pos,
+            r=self.radius_graph_r,
+            max_num_neighbors=self.radius_graph_max_num_neighbors,
+        ).T
+        # edges is (num_points, 2)
+        return edges
+
+    def getitem_grid_to_query_edges(self, idx, ctx=None):
+        assert self.grid_resolution is not None
+        assert self.radius_graph_r is not None
+        query_pos = self.getitem_query_pos(idx, ctx=ctx)
+        grid_pos = self.getitem_grid_pos(idx, ctx=ctx)
+        # create graph between mesh and regular grid points
+        edges = radius(
+            x=grid_pos,
+            y=query_pos,
+            r=self.radius_graph_r,
+            max_num_neighbors=int(1e10),
+        ).T
+        # edges is (num_points, 2)
+        return edges
+
+    def getitem_mesh_pos(self, idx, ctx=None):
+        if ctx is not None and "mesh_pos" in ctx:
+            return ctx["mesh_pos"]
+        mesh_pos = self.getitem_all_pos(idx, ctx=ctx)
+        # sample mesh points
+        if self.num_input_points_ratio is not None:
+            if self.split == "test":
+                assert self.seed is not None
+            if self.seed is not None:
+                # deterministically downsample for evaluation
+                generator = torch.Generator().manual_seed(self.seed + int(idx))
+            else:
+                generator = None
+            # get number of samples
+            if self.num_input_points_ratio[0] == self.num_input_points_ratio[1]:
+                # fixed num_input_points_ratio
+                end = int(len(mesh_pos) * self.num_input_points_ratio[0])
+            else:
+                # variable num_input_points_ratio
+                lb, ub = self.num_input_points_ratio
+                num_input_points_ratio = torch.rand(size=(1,), generator=generator).item() * (ub - lb) + lb
+                end = int(len(mesh_pos) * num_input_points_ratio)
+            # uniform sampling
+            perm = torch.randperm(len(mesh_pos), generator=generator)[:end]
+            mesh_pos = mesh_pos[perm]
+        if ctx is not None:
+            ctx["mesh_pos"] = mesh_pos
+        return mesh_pos
+
+    def getitem_all_pos(self, idx, ctx=None):
+        if ctx is not None and "all_pos" in ctx:
+            return ctx["all_pos"]
+        all_pos = torch.load(self.uris[idx] / "mesh_points.th")
+        # rescale for sincos positional embedding
+        all_pos.sub_(self.domain_min).div_(self.domain_max - self.domain_min).mul_(self.scale)
+        assert torch.all(0 < all_pos)
+        assert torch.all(all_pos < self.scale)
+
+        if self.fun_dim != 0:
+            all_f = torch.load(self.uris[idx] / "mesh_features.th")
+            all_f = (all_f - self.mean_f) / self.std_f
+            all_pos = torch.cat([all_pos, all_f], dim=1)
+
+        if ctx is not None:
+            ctx["all_pos"] = all_pos
+        return all_pos
+
+    def getitem_query_pos(self, idx, ctx=None):
+        if ctx is not None and "query_pos" in ctx:
+            return ctx["query_pos"]
+        query_pos = self.getitem_all_pos(idx, ctx=ctx)
+        # sample query points
+        if self.num_query_points_ratio is not None:
+            if self.split == "test":
+                assert self.seed is not None
+            if self.seed is not None:
+                # deterministically downsample for evaluation
+                generator = torch.Generator().manual_seed(self.seed + int(idx))
+            else:
+                generator = None
+            # get number of samples
+            end = int(len(query_pos) * self.num_query_points_ratio)
+            # uniform sampling
+            perm = torch.randperm(len(query_pos), generator=generator)[:end]
+            query_pos = query_pos[perm]
+        # shift query_pos to [-1, 1] (required for torch.nn.functional.grid_sample)
+        if self.standardize_query_pos:
+            query_pos = query_pos / (self.scale / 2) - 1
+        if ctx is not None:
+            ctx["query_pos"] = query_pos
+        return query_pos
+
+    def _get_generator(self, idx):
+        if self.split == "test":
+            return torch.Generator().manual_seed(int(idx) + (self.seed or 0))
+        if self.seed is not None:
+            return torch.Generator().manual_seed(int(idx) + self.seed)
+        return None
+
+    # noinspection PyUnusedLocal
+    def getitem_mesh_edges(self, idx, ctx=None):
+        assert self.radius_graph_r is not None
+        # load mesh positions
+        mesh_pos = self.getitem_mesh_pos(idx, ctx=ctx)
+        if self.num_supernodes is None:
+            # create graph
+            edges = radius_graph(
+                x=mesh_pos,
+                r=self.radius_graph_r,
+                max_num_neighbors=self.radius_graph_max_num_neighbors,
+                loop=True,
+            )
+        else:
+            # select supernodes
+            generator = self._get_generator(idx)
+            perm = torch.randperm(len(mesh_pos), generator=generator)[:self.num_supernodes]
+            supernodes_pos = mesh_pos[perm]
+            # create edges: this can include self-loop or not depending on how many neighbors are found.
+            # if too many neighbors are found, neighbors are selected randomly which can discard the self-loop
+            edges = radius(
+                x=mesh_pos,
+                y=supernodes_pos,
+                r=self.radius_graph_r,
+                max_num_neighbors=self.radius_graph_max_num_neighbors,
+            )
+            # correct supernode index
+            edges[0] = perm[edges[0]]
+        return edges.T
+
+    # noinspection PyUnusedLocal
+    def getitem_sdf(self, idx, ctx=None):
+        assert self.grid_resolution is not None
+        assert all(self.grid_resolution[0] == grid_resolution for grid_resolution in self.grid_resolution[1:])
+        sdf = torch.load(self.uris[idx] / f"sdf_res{self.grid_resolution[0]}.th")
+        # check that sdf features were generated with correct positions by checking the distance to the nearest point
+        if self.concat_pos_to_sdf:
+            # add position to sdf (GINO uses this for interpolated FNO model)
+            x_linspace = torch.linspace(-1, 1, self.grid_resolution[0])
+            y_linspace = torch.linspace(-1, 1, self.grid_resolution[1])
+            z_linspace = torch.linspace(-1, 1, self.grid_resolution[2])
+            grid_pos = torch.meshgrid(x_linspace, y_linspace, z_linspace, indexing="ij")
+            # stack features (models expect dim_last format)
+            sdf = torch.stack([sdf, *grid_pos], dim=-1)
+        else:
+            sdf = sdf.unsqueeze(-1)
+        return sdf
+
+
+    def getitem_interpolated(self, idx, ctx=None):
+        assert self.grid_resolution is not None
+        assert self.standardize_query_pos
+        mesh_pos = self.getitem_mesh_pos(idx, ctx=ctx)
+        # generate grid positions (these are different than getitem_gridpos because interpolate requires xy indexing)
+        # it should be the same if indexing=ij since the mapping and inverse mapping consider the change in indexing
+        # but for consistency with scipy.interpolate xy was chosen
+        x_linspace = torch.linspace(0, self.scale, self.grid_resolution[0])
+        y_linspace = torch.linspace(0, self.scale, self.grid_resolution[1])
+        z_linspace = torch.linspace(0, self.scale, self.grid_resolution[2])
+        grid_pos = torch.meshgrid(x_linspace, y_linspace, z_linspace, indexing="xy")
+
+        grid = torch.from_numpy(
+            scipy.interpolate.griddata(
+                mesh_pos.unbind(1),
+                torch.ones_like(mesh_pos),
+                grid_pos,
+                method="linear",
+                fill_value=0.,
+            ),
+        ).float()
+
+        return grid
+
+class ShapenetCarCollator(KDSingleCollator):
+    def collate(self, batch, dataset_mode, ctx=None):
+        # make sure that batch was not collated
+        assert isinstance(batch, (tuple, list)) and isinstance(batch[0], tuple)
+
+        batch, ctx = zip(*batch)
+        # properties in context can have variable shapes (e.g. perm) -> delete ctx
+        ctx = {}
+        # dict to hold collated items
+        collated_batch = {}
+
+        # sparse mesh_pos: batch_size * (num_points, ndim) -> (batch_size * num_points, ndim)
+        mesh_pos = []
+        mesh_lens = []
+        for i in range(len(batch)):
+            item = ModeWrapper.get_item(mode=dataset_mode, batch=batch[i], item="mesh_pos")
+            mesh_lens.append(len(item))
+            mesh_pos.append(item)
+        collated_batch["mesh_pos"] = torch.concat(mesh_pos)
+
+        # dense_query_pos: batch_size * (num_points, ndim) -> (batch_size, max_num_points, ndim)
+        # sparse target (decoder output is converted to sparse format before loss)
+        pressures = [ModeWrapper.get_item(mode=dataset_mode, batch=sample, item="pressure") for sample in batch]
+        # predict all positions -> pad
+        query_pos = []
+        query_lens = []
+        for i in range(len(batch)):
+            item = ModeWrapper.get_item(mode=dataset_mode, batch=batch[i], item="query_pos")
+            assert len(item) == len(pressures[i])
+            query_lens.append(len(item))
+            query_pos.append(item)
+        collated_batch["query_pos"] = pad_sequence(query_pos, batch_first=True)
+        collated_batch["pressure"] = torch.concat(pressures).unsqueeze(1)
+        # create batch_idx tensor
+        batch_size = len(mesh_lens)
+        batch_idx = torch.empty(sum(mesh_lens), dtype=torch.long)
+        start = 0
+        cur_batch_idx = 0
+        for i in range(len(mesh_lens)):
+            end = start + mesh_lens[i]
+            batch_idx[start:end] = cur_batch_idx
+            start = end
+            cur_batch_idx += 1
+        ctx["batch_idx"] = batch_idx
+        # create query_batch_idx tensor (required for test loss)
+        query_batch_idx = torch.empty(sum(query_lens), dtype=torch.long)
+        start = 0
+        cur_query_batch_idx = 0
+        for i in range(len(query_lens)):
+            end = start + query_lens[i]
+            query_batch_idx[start:end] = cur_query_batch_idx
+            start = end
+            cur_query_batch_idx += 1
+        ctx["query_batch_idx"] = query_batch_idx
+        # create unbatch_idx tensors (unbatch via torch_geometrics.utils.unbatch)
+        # e.g. batch_size=2, num_points=[2, 3] -> unbatch_idx=[0, 0, 1, 2, 2, 2] unbatch_select=[0, 2]
+        # then unbatching can be done via unbatch(dense, unbatch_idx)[unbatch_select]
+        maxlen = max(query_lens)
+        unbatch_idx = torch.empty(maxlen * batch_size, dtype=torch.long)
+        unbatch_select = []
+        unbatch_start = 0
+        cur_unbatch_idx = 0
+        for i in range(len(query_lens)):
+            unbatch_end = unbatch_start + query_lens[i]
+            unbatch_idx[unbatch_start:unbatch_end] = cur_unbatch_idx
+            unbatch_select.append(cur_unbatch_idx)
+            cur_unbatch_idx += 1
+            unbatch_start = unbatch_end
+            padding = maxlen - query_lens[i]
+            if padding > 0:
+                unbatch_end = unbatch_start + padding
+                unbatch_idx[unbatch_start:unbatch_end] = cur_unbatch_idx
+                cur_unbatch_idx += 1
+                unbatch_start = unbatch_end
+        unbatch_select = torch.tensor(unbatch_select)
+        ctx["unbatch_idx"] = unbatch_idx
+        ctx["unbatch_select"] = unbatch_select
+
+        # normal collation for other properties
+        result = []
+        for item in dataset_mode.split(" "):
+            if item in collated_batch:
+                result.append(collated_batch[item])
+            else:
+                result.append(
+                    default_collate([
+                        ModeWrapper.get_item(mode=dataset_mode, batch=sample, item=item)
+                        for sample in batch
+                    ])
+                )
+
+        return tuple(result), ctx
+
 
 if __name__ == '__main__':
     import numpy as np

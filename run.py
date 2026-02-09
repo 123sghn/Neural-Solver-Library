@@ -74,6 +74,18 @@ parser.add_argument('--save_name', type=str, default='Transolver_check', help='n
 parser.add_argument('--vis_num', type=int, default=10, help='number of visualization cases')
 parser.add_argument('--vis_bound', type=int, nargs='+', default=None, help='size of region for visualization, in list')
 
+## UPT
+parser.add_argument('--radius_graph_r', type=float, default=None, help='radius for radius graph in UPT')
+parser.add_argument('--radius_graph_max_num_neighbors', type=int, default=None, help='max num neighbors for radius graph in UPT')
+parser.add_argument('--num_input_points_ratio', type=float, nargs='+', default=None, help='input points ratio for UPT')
+parser.add_argument('--num_query_points_ratio', type=float, nargs='+', default=None, help='query points ratio for UPT')
+parser.add_argument('--grid_resolution', type=int, default= 64, help='grid resolution for sdf in UPT')
+parser.add_argument('--standardize_query_pos', type=bool, default=False, help='standardize query pos in UPT')
+parser.add_argument('--concat_pos_to_sdf', type=bool, default=False, help='concat pos to sdf in UPT')   
+parser.add_argument('--seed', type=int, default=0, help='random seed')
+parser.add_argument('--sdf_input', type=bool, default=False, help='use sdf input in UPT')
+parser.add_argument('--num_output_tokens', type=int, default=1024, help='number of output tokens for perceiver in UPT')
+
 args = parser.parse_args()
 eval = args.eval
 save_name = args.save_name
@@ -87,6 +99,9 @@ def main():
     elif args.task == 'steady_design':
         from exp.exp_steady_design import Exp_Steady_Design
         exp = Exp_Steady_Design(args)
+    elif args.task == 'steady_design_UPT':
+        from exp.exp_steady_design_UPT import Exp_Steady_Design_UPT
+        exp = Exp_Steady_Design_UPT(args)
     elif args.task == 'dynamic_autoregressive':
         from exp.exp_dynamic_autoregressive import Exp_Dynamic_Autoregressive
         exp = Exp_Dynamic_Autoregressive(args)

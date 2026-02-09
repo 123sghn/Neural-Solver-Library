@@ -7,8 +7,10 @@ import h5py
 import scipy.io as scio
 from data_provider.shapenet_utils import get_datalist
 from data_provider.shapenet_utils import GraphDataset
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from utils.normalizer import UnitTransformer, UnitGaussianNormalizer
+from kappadata.wrappers import ModeWrapper
+from .shapenet_utils import ShapenetCar, ShapenetCarCollator
 
 
 class plas(object):
@@ -757,3 +759,88 @@ class cfd3d(object):
         
         return train_loader, test_loader, [s1, s2, s3]
     
+class car_design_upt:
+    def __init__(self, args):
+        self.data_path = args.data_path
+        self.radius_graph_r = getattr(args, "radius_graph_r", None)
+        self.radius_graph_max_num_neighbors = getattr(args, "radius_graph_max_num_neighbors", None)
+        self.num_input_points_ratio = getattr(args, "num_input_points_ratio", None)
+        self.num_query_points_ratio = getattr(args, "num_query_points_ratio", None)
+        self.grid_resolution = getattr(args, "grid_resolution", None)
+        self.standardize_query_pos = getattr(args, "standardize_query_pos", True)
+        self.concat_pos_to_sdf = getattr(args, "concat_pos_to_sdf", False)
+        self.seed = getattr(args, "seed", 0)
+        self.batch_size = getattr(args, "batch_size", 1)
+        self.num_workers = getattr(args, "num_workers", 4)
+        self.fun_dim = getattr(args, "fun_dim", 0)
+        self.sdf_input = getattr(args, "sdf_input", False)
+
+    def load_train_val_fold(self):
+        train_dataset = ShapenetCar(
+            split="train",
+            data_path=self.data_path,
+            radius_graph_r=self.radius_graph_r,
+            radius_graph_max_num_neighbors=self.radius_graph_max_num_neighbors,
+            num_input_points_ratio=self.num_input_points_ratio,
+            num_query_points_ratio=self.num_query_points_ratio,
+            grid_resolution=self.grid_resolution,
+            standardize_query_pos=self.standardize_query_pos,
+            concat_pos_to_sdf=self.concat_pos_to_sdf,
+            seed=self.seed,
+            fun_dim=self.fun_dim,
+        )
+
+        val_dataset = ShapenetCar(
+            split="test",
+            data_path=self.data_path,
+            radius_graph_r=self.radius_graph_r,
+            radius_graph_max_num_neighbors=self.radius_graph_max_num_neighbors,
+            num_input_points_ratio=self.num_input_points_ratio,
+            num_query_points_ratio=self.num_query_points_ratio,
+            grid_resolution=self.grid_resolution,
+            standardize_query_pos=self.standardize_query_pos,
+            concat_pos_to_sdf=self.concat_pos_to_sdf,
+            seed=self.seed,
+            fun_dim=self.fun_dim,
+        )
+
+        return train_dataset, val_dataset
+
+    def get_loader(self):
+        train_dataset, val_dataset = self.load_train_val_fold()
+
+        self.coef_norm = train_dataset.coef_norm
+
+        if self.sdf_input:
+            dataset_mode = "mesh_pos query_pos pressure sdf"
+        else:
+            dataset_mode = "mesh_pos query_pos pressure"
+
+        train_dataset_wrapped = ModeWrapper(train_dataset, mode=dataset_mode)
+        val_dataset_wrapped = ModeWrapper(val_dataset, mode=dataset_mode)
+
+        collator = ShapenetCarCollator()
+
+        train_loader = DataLoader(
+            [(sample, {}) for sample in train_dataset_wrapped],
+            batch_size=self.batch_size,
+            shuffle=True,
+            collate_fn=lambda batch: collator.collate(batch, dataset_mode, ctx={}),
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+
+        val_loader = DataLoader(
+            [(sample, {}) for sample in val_dataset_wrapped],
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=lambda batch: collator.collate(batch, dataset_mode, ctx={}),
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+
+        if self.sdf_input:
+            sample_mesh, _, _, _ = train_dataset_wrapped[0]
+        else:
+            sample_mesh, _, _ = train_dataset_wrapped[0]
+        return train_loader, val_loader, [sample_mesh.shape[0], sample_mesh.shape[1]]

@@ -1,0 +1,21 @@
+python run.py \
+--gpu 0 \
+--data_path /data/PDE_data/shapenetcar_data/ \
+--loader car_design_upt \
+--geotype unstructured \
+--task steady_design_UPT \
+--space_dim 3 \
+--fun_dim 0 \
+--out_dim 1 \
+--lr 5.0e-4 \
+--epochs 200 \
+--batch-size 32 \
+--eval 0 \
+--n_hidden 768 \
+--n_heads 12 \
+--n_layers 12 \
+--model UPT \
+--grid_resolution 64 \
+--seed 0 \
+--num_output_tokens 1024 \
+--save_name car_design_UPT
